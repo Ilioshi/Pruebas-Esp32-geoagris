@@ -1,0 +1,7 @@
+asyncio==3.4.3
+bleak==0.22.3
+dbus-fast==2.33.0
+prompt_toolkit==3.0.50
+questionary==2.1.0
+tqdm==4.67.1
+wcwidth==0.2.13
