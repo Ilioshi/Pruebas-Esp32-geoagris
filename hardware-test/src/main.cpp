@@ -58,6 +58,8 @@ LinkStats rs485Stats{"RS485"};
 String ttl1Buffer;
 String ttl2Buffer;
 String rs485Buffer;
+uint32_t rs485Bytes = 0;
+uint32_t rs485Nulos = 0;
 uint32_t nextSequence = 0;
 uint32_t lastPingAt = 0;
 uint32_t lastStatusAt = 0;
@@ -82,6 +84,13 @@ void report(const String& message) {
 bool readLine(Stream& port, String& buffer, String& line) {
   while (port.available()) {
     const char c = static_cast<char>(port.read());
+    if (&port == static_cast<Stream*>(&rs485)) {
+      ++rs485Bytes;
+      if (c == '\0') {
+        ++rs485Nulos;
+        continue;  // No agregar este byte al mensaje.
+      }
+    }
     if (c == '\r') {
       continue;
     }
