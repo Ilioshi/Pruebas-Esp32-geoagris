@@ -1,113 +1,82 @@
-# Firmware de prueba de hardware
+# Hardware test de las placas ESP32
 
-Un unico firmware para las dos placas. El codigo esta en `src/main.cpp`; la unica diferencia entre placas es `DEVICE_ID`, definido por el entorno de PlatformIO.
+Este proyecto contiene solo el firmware de prueba de dos placas ESP32. Se carga el mismo `src/main.cpp` en ambas; el entorno de PlatformIO define `DEVICE_ID=1` (placa de referencia) o `DEVICE_ID=2` (placa bajo prueba). Ambas placas deben llevar esta version para compartir resultados y capturas.
 
-## Que prueba
+## Que comprueba
 
-- TTL1 bidireccional: UART2, RX25/TX26, 115200.
-- TTL2 bidireccional: UART0, RX3/TX1, 115200.
-- RS485 bidireccional: UART1, RX16/TX17, DE/RE4, 9600.
-- CAN MCP2515: CS5, SCK18, MISO19, MOSI23, 250 kbps, cristal 8 MHz.
-- Pulsos: GPIO27 y GPIO35.
-- Consola de diagnostico por Bluetooth clasico SPP.
+| Canal | Pines de la ESP32 | Prueba |
+| --- | --- | --- |
+| TTL1 | RX GPIO25, TX GPIO26; 115200 baud | Cada placa envia PING y responde PONG a la otra. |
+| TTL2 | RX GPIO3, TX GPIO1; 115200 baud | Igual que TTL1; comparte UART0 con el USB. |
+| RS485 | RX GPIO16, TX GPIO17, DE/RE GPIO4; 9600 baud | Placa 1 envia PING y placa 2 responde PONG. Ambas envian informes. |
+| CAN | MCP2515: CS5, SCK18, MISO19, MOSI23; 250 kbit/s, cristal 8 MHz | Cada placa envia una trama de prueba y cuatro tramas de informe. |
+| Pulsos | GPIO27 y GPIO35 **de placa 2** | Flancos ascendentes, promedio de pulsos/s en la ultima ventana y total acumulado. |
 
-Cada placa envia `PING` y espera `PONG` por TTL1, TTL2 y CAN. En RS485 la placa 1 inicia la prueba y la placa 2 responde. Los resultados se informan localmente por Bluetooth, por lo que un fallo de un enlace no impide ver el diagnostico.
+Los resultados salen por Bluetooth clasico SPP (`HWTEST-ESP32-1` y `HWTEST-ESP32-2`), no por BLE. La placa 1 se considera una referencia conocida al evaluar la placa 2. Un resultado localiza el trayecto donde falla la prueba; por si solo no demuestra cual componente fisico se averio.
 
-## Preparar la carga
+## Carga y conexiones
 
-Abrir en VS Code la carpeta `hardware-test`. Desde la terminal integrada, PlatformIO puede ejecutarse con `pio`; si no aparece en el PATH, usar:
-
-```powershell
-$pio = "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe"
-```
-
-El firmware no se carga desde `AgX-Compact-esp32-main-modificado`: esa carpeta es la copia del firmware original y queda como referencia.
-
-## Cargar las placas
-
-Usar el mismo cable USB y el mismo codigo para ambas placas:
-
-1. Conectar la primera placa y seleccionar su puerto COM.
-2. Cargar el entorno de placa 1:
+Abrir esta carpeta `hardware-test` como proyecto de PlatformIO. Seleccionar expresamente el entorno al cargar: el `default_envs` de `platformio.ini` puede cambiar.
 
 ```powershell
 pio run -e esp32-hardware-test -t upload --upload-port COM7
-```
-
-3. Desconectar la primera placa, conectar la segunda y reemplazar `COM7` por su puerto.
-4. Cargar el entorno de placa 2:
-
-```powershell
 pio run -e esp32-hardware-test-2 -t upload --upload-port COM8
 ```
 
-Los entornos solo cambian el numero compilado:
+Reemplazar `COM7` y `COM8` por los puertos reales. `esp32-hardware-test` compila la placa 1; `esp32-hardware-test-2`, la placa 2. No hay que editar `main.cpp` ni comentar y descomentar una linea para cambiar de placa.
+
+Conectar TTL1 TX26 de cada placa al RX25 de la otra; TTL2 TX1 de cada placa al RX3 de la otra; masa comun. En RS485 conectar A con A, B con B y masa comun. En CAN conectar H con H, L con L y masa comun. Usar terminacion de 120 ohm en los extremos de cada bus RS485 y CAN, segun el montaje. Para TTL2, desconectar el USB durante la prueba: GPIO1 y GPIO3 son UART0 y el USB puede interferir. GPIO35 no tiene pull-up interno; aplicarle una senal externa adecuada. Las entradas de pulsos se prueban solo en placa 2.
+
+## Uso por Bluetooth
+
+Las pruebas empiezan al encender. Con una aplicacion de terminal Bluetooth **clasico SPP**, conectarse a cualquiera de las dos placas y enviar el comando seguido de salto de linea. El resumen aparece automaticamente cada 10 segundos.
+
+| Comando | Resultado |
+| --- | --- |
+| `STATUS` | Repite el resumen de los ultimos 10 segundos. |
+| `DATOS` o `DATA` | Detalle por canal de ambas placas y matriz compacta de informes `INFO`. |
+| `TTL1`, `TTL2`, `RS485`, `CAN` | Mismo formato por canal: ambas placas, sentidos 1->2 y 2->1, comparacion de prueba, TX/RX crudos y copias `INFO`. RS485 agrega la captura coordinada del informe de placa 2. |
+| `RAW` | RX crudo de los cuatro canales y de ambas placas, identificado por placa, canal e informe. Incluye CAN y datos no validos. Usa la ultima ventana cerrada disponible. |
+| `RUN`, `STOP` | Reanuda o detiene los PING automaticos. |
+| `HELP` | Lista los comandos. |
+
+`DATOS` es para decidir rapidamente que canal revisar; los comandos con nombre de canal muestran las tramas y lecturas sin agrandar el informe general. Los numeros de las dos placas pueden variar en una misma ventana porque sus relojes y cierres de 10 segundos no estan sincronizados.
+
+Los separadores tienen el mismo significado en los informes:
 
 ```text
-esp32-hardware-test    -> DEVICE_ID=1 -> HWTEST-ESP32-1
-esp32-hardware-test-2  -> DEVICE_ID=2 -> HWTEST-ESP32-2
+********************************
+DATOS - ultimos 10 s
+======== TTL1 ========
+// PRUEBA //
+--- PLACA 1 ---
+Estado: ...
+--- PLACA 2 ---
+Estado: ...
+// SENTIDOS DE LA PRUEBA //
+1->2: ...
+2->1: ...
+// INFORMES EN AMBOS SENTIDOS //
+1->2: informe ...; recibidos .../4
+2->1: informe ...; recibidos .../4
+======== TTL2 ========
+...
+********************************
 ```
 
-No hay dos archivos `main.cpp` ni dos programas distintos.
+Cada receptor confirma por TTL1 las copias INFO que reconocio en cada canal. Una confirmacion pendiente no se interpreta como fallo del canal. Los informes nuevos tienen un margen de 3,5 segundos antes de marcar una copia faltante como `NO LLEGA`, tambien en los comandos individuales.
 
-## Conexion entre placas
+## Como leer los resultados
 
-- TTL1: TX26 de una placa a RX25 de la otra, RX26 a TX25 y masa comun.
-- TTL2: TX1 de una placa a RX3 de la otra, RX3 a TX1 y masa comun.
-- RS485: A con A, B con B y masa comun; terminacion de 120 ohm en los extremos.
-- CAN: CANH con CANH, CANL con CANL y masa comun; terminacion de 120 ohm en los extremos.
-- Pulsos: aplicar una señal de prueba a GPIO27 y GPIO35 de cada placa.
+- En TTL1/TTL2, `PING enviados` cuenta los pedidos propios; `PONG confirmados`, sus respuestas correctas. `PING del otro recibidos` y `PONG enviados` miden la direccion inversa. Un PING al borde de una ventana puede figurar pendiente y cerrarse en la siguiente.
+- En RS485, solo placa 1 inicia PING. Si placa 2 no reconoce ese PING, no tiene motivo para generar PONG. El informe RS485 de placa 2 se intenta por separado aunque falle PING/PONG. `RS485` distingue los bytes escritos en cada UART de los que realmente leyo la otra placa; escribir en UART no prueba que haya senal correcta en A/B.
+- `<00>` es un byte NUL recibido por la UART RS485, no un PONG. Un NUL aislado puede coincidir con la conmutacion del transceptor y no se atribuye automaticamente a una placa. Si no llega una trama valida, `RS485` muestra la muestra cruda y el esperado cuando existe una captura comparable. Para saber su origen electrico hacen falta mediciones del bus y transceptores.
+- En CAN no hay PONG: cada placa envia una trama y la otra comprueba ID, DLC y datos. `buffer RX lleno` significa que el MCP2515 no pudo guardar alguna trama; su contenido perdido no puede mostrarse como `recibido`. Las cuatro tramas de informe CAN se espacian para reducir este riesgo.
+- `COPIAS INFO` compara el mismo informe de la otra placa recibido por TTL1, TTL2, RS485 y CAN. `REFERENCIA`/`REF` es la primera copia disponible, `IGUAL` coincide con ella, `DIFERENTE` no coincide, `EN CAMINO` aun puede llegar y `NO LLEGA` indica que no se reconocio una copia valida. Una primera copia no prueba por si sola que su contenido sea correcto.
+- La linea de pulsos muestra `GPIO27=... p/s; GPIO35=... p/s` y debajo `Contador`. El calculo sigue usando solo los pulsos nuevos de la ultima ventana, dividido por su duracion real (normalmente 10 s), con una cifra decimal. `Contador` es el acumulado desde el arranque de placa 2. La placa 1 recibe ambos valores por TTL1; si ese informe falta, dice `sin dato reciente`.
 
-TTL2 usa UART0 y comparte GPIO1/3 con el USB. Se puede usar el USB para cargar, pero debe desconectarse durante la prueba de TTL2. La consola de resultados se usa por Bluetooth.
+Las capturas UART conservan los ultimos 1024 bytes por placa, canal y direccion de cada ventana; CAN conserva las ultimas 32 tramas por direccion con ID, DLC y datos. `RAW` muestra todo lo conservado en RX, incluidos NUL y mensajes auxiliares; los bytes UART aparecen en HEX y TXT. Si una ventana excede el limite, aparece `RECORTADO` y cuantos datos se conservaron. No es un registro ilimitado desde el encendido. El TX UART muestra PING/PONG/INFO; el RX incluye tambien la comunicacion auxiliar de diagnostico.
 
-GPIO35 es entrada solamente y no tiene pull-up interno; necesita una señal externa correctamente polarizada.
+Cada muestra identifica su informe. Las ventanas de ambas placas no son simultaneas; no deben compararse sus muestras byte a byte como si correspondieran al mismo instante. La muestra remota viaja en fragmentos por TTL1 y solo se publica cuando esta completa. Un CRC detecta alteraciones en los mensajes auxiliares; una comparacion remota etiquetada `CORRECTA` tambien debe pasar una validacion del contenido. Si falta una muestra o se rechaza un mensaje auxiliar, se indica sin atribuirle una falla al canal ensayado. Cargar esta version en ambas placas es necesario para este protocolo.
 
-## Bluetooth: clasico SPP, no BLE
-
-El firmware usa `BluetoothSerial`, que corresponde a Bluetooth clasico con perfil SPP (puerto serie). No usa BLE/GATT. Por eso hay que buscar los dispositivos desde una aplicacion compatible con Bluetooth Serial/SPP.
-
-## Usar Bluetooth Serial Terminal
-
-1. Cargar ambas placas y conectar todos los cables de prueba.
-2. Alimentar las placas y esperar unos segundos.
-3. Abrir una aplicacion compatible con Bluetooth clasico SPP, por ejemplo Bluetooth Serial Terminal.
-4. Conectarse a `HWTEST-ESP32-1` o `HWTEST-ESP32-2`.
-5. Las pruebas empiezan automaticamente al arrancar: no hace falta enviar `RUN` para iniciar la prueba.
-6. Enviar los comandos terminados en salto de linea:
-
-```text
-STATUS
-HELP
-STOP
-RUN
-```
-
-El estado tambien se envia automaticamente cada cinco segundos.
-
-- `STATUS`: muestra el estado actual sin cambiar la prueba.
-- `RUN`: reanuda las pruebas automaticas si estaban detenidas.
-- `STOP`: detiene los nuevos `PING`; mantiene disponible `STATUS`.
-- `HELP`: muestra los comandos disponibles.
-
-El estado indica `RUNNING` o `STOPPED`. Para la prueba normal solo hay que conectar ambas placas y observar el estado; `STOP` y `RUN` son utiles para aislar un enlace o repetir una prueba.
-
-## Interpretar el resultado
-
-Ejemplo:
-
-```text
---- HWTEST placa 1 ---
-TTL1: tx=10 rx=10 ok=10 err=0
-TTL2: tx=10 rx=10 ok=10 err=0
-RS485: tx=10 rx=10 ok=10 err=0
-CAN: tx=10 rx=10 ok=10 err=0
-PULSOS: pin27=25 pin35=25
-```
-
-- `tx`: mensajes enviados por ese canal.
-- `rx`: mensajes recibidos.
-- `ok`: respuestas o tramas validas del otro nodo.
-- `err`: timeouts o respuestas invalidas.
-- En `PULSOS`, los valores son los conteos acumulados desde el arranque.
-
-Un canal con `tx` aumentando y `rx=0` indica que la placa local transmite, pero no recibe respuesta. Un `tx` que no aumenta puede indicar que el canal no esta siendo iniciado, un problema de configuracion o un cableado incorrecto.
+RS485 conserva ademas una captura de hasta 128 bytes asociada al intento de informe de placa 2, independiente de la muestra general de su ventana. Los limites y cualquier recorte se indican. Los envios de diagnostico por TTL1 y la salida Bluetooth se dosifican para que el bucle siga atendiendo las recepciones.
