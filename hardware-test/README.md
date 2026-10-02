@@ -35,36 +35,15 @@ Las pruebas empiezan al encender. Con una aplicacion de terminal Bluetooth **cla
 | --- | --- |
 | `STATUS` | Repite el resumen de los ultimos 10 segundos. |
 | `DATOS` o `DATA` | Detalle por canal de ambas placas y matriz compacta de informes `INFO`. |
-| `TTL1`, `TTL2`, `RS485`, `CAN` | Mismo formato por canal: ambas placas, sentidos 1->2 y 2->1, comparacion de prueba, TX/RX crudos y copias `INFO`. RS485 agrega la captura coordinada del informe de placa 2. |
-| `RAW` | RX crudo de los cuatro canales y de ambas placas, identificado por placa, canal e informe. Incluye CAN y datos no validos. Usa la ultima ventana cerrada disponible. |
+| `TTL1`, `TTL2`, `CAN` | Diagnostico extendido del canal: estado de cada placa, comparacion de la ultima trama de prueba, TX/RX crudos y las cuatro copias `INFO` recibidas por ese canal. |
+| `RS485` | Diagnostico extendido RS485: PING/PONG, texto enviado, capturas recibidas y comparacion del informe de placa 2. |
+| `RAW` | Ultimas muestras RX de ambas placas para TTL1, TTL2, RS485 y CAN; incluye datos invalidos y auxiliares. |
 | `RUN`, `STOP` | Reanuda o detiene los PING automaticos. |
 | `HELP` | Lista los comandos. |
 
-`DATOS` es para decidir rapidamente que canal revisar; los comandos con nombre de canal muestran las tramas y lecturas sin agrandar el informe general. Los numeros de las dos placas pueden variar en una misma ventana porque sus relojes y cierres de 10 segundos no estan sincronizados.
+`DATOS` separa los cuatro canales, muestra el estado de cada placa y deja los informes 1->2 y 2->1 en dos lineas breves, sin encabezados repetidos. Una sola seccion `COPIAS INFO` compara las copias del ultimo informe remoto. Los comandos con nombre de canal agregan las tramas y lecturas crudas. Los numeros de las dos placas pueden variar en una misma ventana porque sus relojes y cierres de 10 segundos no estan sincronizados.
 
-Los separadores tienen el mismo significado en los informes:
-
-```text
-********************************
-DATOS - ultimos 10 s
-======== TTL1 ========
-// PRUEBA //
---- PLACA 1 ---
-Estado: ...
---- PLACA 2 ---
-Estado: ...
-// SENTIDOS DE LA PRUEBA //
-1->2: ...
-2->1: ...
-// INFORMES EN AMBOS SENTIDOS //
-1->2: informe ...; recibidos .../4
-2->1: informe ...; recibidos .../4
-======== TTL2 ========
-...
-********************************
-```
-
-Cada receptor confirma por TTL1 las copias INFO que reconocio en cada canal. Una confirmacion pendiente no se interpreta como fallo del canal. Los informes nuevos tienen un margen de 3,5 segundos antes de marcar una copia faltante como `NO LLEGA`, tambien en los comandos individuales.
+Cada receptor confirma por TTL1 las copias `INFO` que reconocio en cada canal. Una confirmacion pendiente no se interpreta como fallo del canal. Los informes nuevos tienen un margen de 3,5 segundos antes de marcar una copia faltante como `NO LLEGA`, tambien en los comandos individuales.
 
 ## Como leer los resultados
 
@@ -73,7 +52,7 @@ Cada receptor confirma por TTL1 las copias INFO que reconocio en cada canal. Una
 - `<00>` es un byte NUL recibido por la UART RS485, no un PONG. Un NUL aislado puede coincidir con la conmutacion del transceptor y no se atribuye automaticamente a una placa. Si no llega una trama valida, `RS485` muestra la muestra cruda y el esperado cuando existe una captura comparable. Para saber su origen electrico hacen falta mediciones del bus y transceptores.
 - En CAN no hay PONG: cada placa envia una trama y la otra comprueba ID, DLC y datos. `buffer RX lleno` significa que el MCP2515 no pudo guardar alguna trama; su contenido perdido no puede mostrarse como `recibido`. Las cuatro tramas de informe CAN se espacian para reducir este riesgo.
 - `COPIAS INFO` compara el mismo informe de la otra placa recibido por TTL1, TTL2, RS485 y CAN. `REFERENCIA`/`REF` es la primera copia disponible, `IGUAL` coincide con ella, `DIFERENTE` no coincide, `EN CAMINO` aun puede llegar y `NO LLEGA` indica que no se reconocio una copia valida. Una primera copia no prueba por si sola que su contenido sea correcto.
-- La linea de pulsos muestra `GPIO27=... p/s; GPIO35=... p/s` y debajo `Contador`. El calculo sigue usando solo los pulsos nuevos de la ultima ventana, dividido por su duracion real (normalmente 10 s), con una cifra decimal. `Contador` es el acumulado desde el arranque de placa 2. La placa 1 recibe ambos valores por TTL1; si ese informe falta, dice `sin dato reciente`.
+- La linea de pulsos muestra `GPIO27=... p/s; GPIO35=... p/s` y debajo `Contador`. El calculo usa solo los pulsos nuevos de la ultima ventana, dividido por su duracion real (normalmente 10 s), con una cifra decimal. `Contador` es el acumulado desde el arranque de placa 2. La placa 1 recibe ambos valores por TTL1; si ese informe falta, dice `sin dato reciente`.
 
 Las capturas UART conservan los ultimos 1024 bytes por placa, canal y direccion de cada ventana; CAN conserva las ultimas 32 tramas por direccion con ID, DLC y datos. `RAW` muestra todo lo conservado en RX, incluidos NUL y mensajes auxiliares; los bytes UART aparecen en HEX y TXT. Si una ventana excede el limite, aparece `RECORTADO` y cuantos datos se conservaron. No es un registro ilimitado desde el encendido. El TX UART muestra PING/PONG/INFO; el RX incluye tambien la comunicacion auxiliar de diagnostico.
 

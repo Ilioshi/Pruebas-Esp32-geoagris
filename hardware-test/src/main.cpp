@@ -1570,8 +1570,8 @@ String peerInfoText(uint8_t channel, const PeerCopy& copy) {
 
 void reportPeerCopyMatrix() {
   if (latestPeerReportId == 0 || millis() - latestPeerAt > PEER_STALE_MS) return;
-  report("COPIAS INFO placa " + String(DEVICE_ID == 1 ? 2 : 1) +
-         " (informe " + String(latestPeerReportId) + ")");
+  report("======== COPIAS INFO PLACA " + String(DEVICE_ID == 1 ? 2 : 1) +
+         " (informe " + String(latestPeerReportId) + ") ========");
   for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
     const PeerCopy* first = firstPeerCopy(channel);
     if (first)
@@ -1648,7 +1648,6 @@ uint8_t validRs485Reports(uint8_t reportId) {
 }
 
 void reportRs485Exchange() {
-  report("Placa 2 -> placa 1: informe RS485");
   if (!rs485ReportTrace.txReported ||
       millis() - rs485ReportTrace.txReportedAt > PEER_STALE_MS) {
     report("  Aun no se recibio aviso de intento TX de placa 2");
@@ -1724,27 +1723,6 @@ void reportBothBoards(uint8_t channel, bool detailed) {
   }
 }
 
-void reportTestDirections(uint8_t channel) {
-  report("// SENTIDOS DE LA PRUEBA //");
-  for (uint8_t sender = 1; sender <= 2; ++sender) {
-    const uint8_t receiver = sender == 1 ? 2 : 1;
-    const String label = String(sender) + "->" + String(receiver) + ": ";
-    const ChannelWindow* window = boardWindow(receiver, channel);
-    const FlowWindow* flow = boardFlow(receiver, channel);
-    if (!window || (channel < 3 && !flow)) {
-      report(label + "sin dato reciente de placa " + String(receiver));
-    } else if (channel == 3) {
-      report(label + "pruebas recibidas=" + String(window->rx) +
-             "; correctas=" + String(window->ok));
-    } else if (channel == 2 && sender == 2) {
-      report(label + "PONG recibidos=" + String(flow->pongRx) +
-             "; confirmados=" + String(window->ok));
-    } else {
-      report(label + "PING recibidos=" + String(flow->pingRx));
-    }
-  }
-}
-
 uint8_t maskCount(uint8_t mask) {
   uint8_t count = 0;
   for (uint8_t i = 0; i < CHANNEL_COUNT; ++i) if (mask & (1 << i)) ++count;
@@ -1752,39 +1730,39 @@ uint8_t maskCount(uint8_t mask) {
 }
 
 void reportInfoDirections(uint8_t channel) {
-  report("// INFORMES EN AMBOS SENTIDOS //");
   for (uint8_t sender = 1; sender <= 2; ++sender) {
-    const String label = String(sender) + "->" + String(sender == 1 ? 2 : 1) + ": ";
+    String summary = "INFO " + String(sender) + "->" +
+                     String(sender == 1 ? 2 : 1) + ": ";
     if (sender == DEVICE_ID) {
       if (!localReportId) {
-        report(label + "todavia no se genero el primer informe");
-        continue;
+        summary += "sin informe";
+      } else {
+        const ReportReceipt& receipt = peerReceipts[channel];
+        if (receipt.reportId == localReportId &&
+            millis() - receipt.receivedAt <= PEER_STALE_MS)
+          summary += "informe " + String(receipt.reportId) +
+                     ", recibidos " + String(maskCount(receipt.mask)) + "/4";
+        else
+          summary += "informe " + String(localReportId) + ", confirmacion " +
+                     (millis() - lastWindowCapturedAt < REPORT_SETTLE_MS + 3000 ?
+                      "en camino" : "no recibida por TTL1");
       }
-      const ReportReceipt& receipt = peerReceipts[channel];
-      if (localReportId && receipt.reportId == localReportId &&
-          millis() - receipt.receivedAt <= PEER_STALE_MS)
-        report(label + "informe " + String(receipt.reportId) +
-               "; recibidos " + String(maskCount(receipt.mask)) + "/4");
-      else
-        report(label + "informe " + String(localReportId) +
-               "; confirmacion " +
-               (millis() - lastWindowCapturedAt < REPORT_SETTLE_MS + 3000 ?
-                "en camino" : "no recibida por TTL1"));
     } else if (latestPeerReportId && millis() - latestPeerAt <= PEER_STALE_MS) {
       const uint8_t count = maskCount(receivedInfoMask(channel, latestPeerReportId));
-      report(label + "informe " + String(latestPeerReportId) +
-             "; recibidos " + String(count) + "/4" +
-             (count < 4 && millis() - latestPeerFirstAt < REPORT_SETTLE_MS ?
-              " (en camino)" : ""));
+      summary += "informe " + String(latestPeerReportId) +
+                 ", recibidos " + String(count) + "/4" +
+                 (count < 4 && millis() - latestPeerFirstAt < REPORT_SETTLE_MS ?
+                  " (en camino)" : "");
     } else {
-      report(label + "sin informe reciente");
+      summary += "sin informe reciente";
     }
+    report(summary);
   }
 }
 
 void reportDiagnosticHealth() {
   if (diagnosticRejected || diagnosticDropped)
-    report("Datos auxiliares: rechazados=" + String(diagnosticRejected) +
+    report("Datos auxiliares (desde arranque): rechazados=" + String(diagnosticRejected) +
            "; envios omitidos=" + String(diagnosticDropped) +
            " (detalle remoto puede estar incompleto)");
 }
@@ -1792,17 +1770,13 @@ void reportDiagnosticHealth() {
 void printDetails() {
   report("********************************");
   report("DATOS - ultimos 10 s");
-  report("Ventanas independientes por placa");
   if (!automaticTestsEnabled) report("PRUEBAS DETENIDAS");
   for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
     report("======== " + String(CHANNEL_NAMES[channel]) + " ========");
-    report("// PRUEBA //");
     reportBothBoards(channel, false);
-    reportTestDirections(channel);
     reportInfoDirections(channel);
   }
   if (latestPeerReportId && millis() - latestPeerAt <= PEER_STALE_MS) {
-    report("======== COPIAS INFO ========");
     reportPeerCopyMatrix();
   }
   report("======== PULSOS ========");
@@ -1816,10 +1790,9 @@ uint8_t traceHexByte(const String& hex, size_t offset) {
   return static_cast<uint8_t>(strtoul(pair.c_str(), nullptr, 16));
 }
 
-void reportRawTrace(uint8_t channel, uint8_t device, const char* direction,
+void reportRawTrace(uint8_t channel, const char* direction,
                     const RawTrace* trace, uint8_t reportId) {
-  const String label = "Placa " + String(device) + " " +
-                       String(direction) + " " + CHANNEL_NAMES[channel] +
+  const String label = String(direction) +
                        (reportId ? " (informe " + String(reportId) + ")" : "");
   if (!trace) {
     report(label + ": sin muestra reciente (via TTL1)");
@@ -1862,26 +1835,26 @@ void reportRawTrace(uint8_t channel, uint8_t device, const char* direction,
 void reportBoardRaw(uint8_t channel, uint8_t board, bool withTx) {
   report("--- PLACA " + String(board) + " ---");
   if (board == DEVICE_ID) {
-    if (withTx) reportRawTrace(channel, board, "TX", localReportId ?
+    if (withTx) reportRawTrace(channel, "TX", localReportId ?
                                &txTraceWindow[channel] : nullptr, localReportId);
-    reportRawTrace(channel, board, "RX", localReportId ?
+    reportRawTrace(channel, "RX", localReportId ?
                     &rxTraceWindow[channel] : nullptr, localReportId);
     return;
   }
   const PeerRawTrace& tx = peerTxTrace[channel];
   const PeerRawTrace& rx = peerRxTrace[channel];
-  if (withTx) reportRawTrace(channel, board, "TX",
+  if (withTx) reportRawTrace(channel, "TX",
     tx.reportId && millis() - tx.receivedAt <= PEER_STALE_MS ? &tx.trace : nullptr,
     tx.reportId);
-  reportRawTrace(channel, board, "RX",
+  reportRawTrace(channel, "RX",
     rx.reportId && millis() - rx.receivedAt <= PEER_STALE_MS ? &rx.trace : nullptr,
     rx.reportId);
 }
 
 void reportChannelCopies(uint8_t via) {
   const uint8_t remote = DEVICE_ID == 1 ? 2 : 1;
-  report("Informes de placa " + String(remote) + " recibidos via " +
-         CHANNEL_NAMES[via] + ":");
+  report("======== COPIAS INFO PLACA " + String(remote) + " VIA " +
+         CHANNEL_NAMES[via] + " ========");
   if (!latestPeerReportId || millis() - latestPeerAt > PEER_STALE_MS) {
     report("Sin informe reciente para comparar");
     return;
@@ -1920,19 +1893,14 @@ void printChannelDetails(uint8_t channel) {
   report("********************************");
   report(String(CHANNEL_NAMES[channel]) +
          " - DIAGNOSTICO COMPLETO (ultimos 10 s)");
-  report("Las ventanas de las placas no estan sincronizadas");
-  report("// PRUEBA Y COMPARACION RX //");
   reportBothBoards(channel, true);
-  reportTestDirections(channel);
   reportInfoDirections(channel);
-  report("// TX/RX CRUDOS //");
-  report("TX UART: PING/PONG/INFO; RX UART: todo, incluidos auxiliares");
+  report("======== TX/RX CRUDOS ========");
   reportBoardRaw(channel, 1, true);
   reportBoardRaw(channel, 2, true);
-  report("// COPIAS INFO POR ESTE CANAL //");
   reportChannelCopies(channel);
   if (channel == 2 && DEVICE_ID == 1) {
-    report("// CAPTURA COORDINADA DEL INFORME RS485 //");
+    report("======== INFORME RS485 2->1 ========");
     reportRs485Exchange();
   }
   reportDiagnosticHealth();
