@@ -136,6 +136,10 @@ uint32_t localPulse1 = 0;
 uint32_t localPulse2 = 0;
 uint32_t previousPulse1 = 0;
 uint32_t previousPulse2 = 0;
+uint32_t pulseRatePrevious1 = 0;
+uint32_t pulseRatePrevious2 = 0;
+uint32_t pulseRateSampleAt = 0;
+bool pulseRateReady = false;
 uint32_t localPulseRate1 = 0;  // Decimas de pulso por segundo.
 uint32_t localPulseRate2 = 0;
 uint32_t peerPulse1 = 0;
@@ -317,6 +321,40 @@ void processDiagnosticOutput() {
   ttl1.println(text);
   diagnosticQueue.pop_front();
   diagnosticNextAt = millis() + 15;
+}
+
+void sendPulseSample() {
+  if (DEVICE_ID != 2 || !pulseRateReady) return;
+  // Sustituir una muestra aun en cola para no entregar tasas viejas despues.
+  for (auto it = diagnosticQueue.begin(); it != diagnosticQueue.end();) {
+    if (it->startsWith("PULSE,")) it = diagnosticQueue.erase(it);
+    else ++it;
+  }
+  // Contadores de la ultima ventana cerrada de 10 s y tasa del ultimo segundo.
+  sendDiagnostic("PULSE,2," + String(localReportId) + "," +
+                 String(localPulse1) + "," + String(localPulse2) + "," +
+                 String(localPulseRate1) + "," + String(localPulseRate2), true);
+}
+
+void samplePulseRate() {
+  if (DEVICE_ID != 2) return;
+  const uint32_t now = millis();
+  const uint32_t elapsed = now - pulseRateSampleAt;
+  if (elapsed < 1000) return;
+  noInterrupts();
+  const uint32_t count1 = pulse1;
+  const uint32_t count2 = pulse2;
+  interrupts();
+  // Normalizar por el tiempo real evita error por el pequeno retraso del loop.
+  localPulseRate1 = static_cast<uint32_t>(
+    static_cast<uint64_t>(count1 - pulseRatePrevious1) * 10000 / elapsed);
+  localPulseRate2 = static_cast<uint32_t>(
+    static_cast<uint64_t>(count2 - pulseRatePrevious2) * 10000 / elapsed);
+  pulseRatePrevious1 = count1;
+  pulseRatePrevious2 = count2;
+  pulseRateSampleAt = now;
+  pulseRateReady = true;
+  sendPulseSample();
 }
 
 bool isDiagnostic(const String& text) {
@@ -589,18 +627,13 @@ void captureAllWindows() {
   canOverflowRx1Window = cappedDelta(canOverflowRx1, previousCanOverflowRx1);
   if (DEVICE_ID == 2) {
     noInterrupts();
-    localPulse1 = pulse1;
-    localPulse2 = pulse2;
+    const uint32_t count1 = pulse1;
+    const uint32_t count2 = pulse2;
     interrupts();
-    const uint32_t elapsed = millis() - lastWindowCapturedAt;
-    if (elapsed > 0) {
-      localPulseRate1 = static_cast<uint32_t>(
-        static_cast<uint64_t>(localPulse1 - previousPulse1) * 10000 / elapsed);
-      localPulseRate2 = static_cast<uint32_t>(
-        static_cast<uint64_t>(localPulse2 - previousPulse2) * 10000 / elapsed);
-    }
-    previousPulse1 = localPulse1;
-    previousPulse2 = localPulse2;
+    localPulse1 = count1 - previousPulse1;
+    localPulse2 = count2 - previousPulse2;
+    previousPulse1 = count1;
+    previousPulse2 = count2;
   }
   LinkStats* serialStats[3] = {&ttl1Stats, &ttl2Stats, &rs485Stats};
   for (uint8_t channel = 0; channel < 3; ++channel) {
@@ -675,11 +708,7 @@ void sendInfoSerial(HardwareSerial& port, bool halfDuplex) {
   if (&port == &ttl1) {
     for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel)
       sendDiagnostic(flowLine(channel));
-    if (DEVICE_ID == 2)
-      sendDiagnostic("PULSE,2," + String(localReportId) + "," +
-                   String(localPulse1) + "," + String(localPulse2) + "," +
-                   String(localPulseRate1) + "," +
-                   String(localPulseRate2));
+    sendPulseSample();
     if (DEVICE_ID == 2)
       sendDiagnostic("RRX,2," + String(localReportId) + "," +
                    String(rs485ReportSampleBytes) + "," +
@@ -936,7 +965,7 @@ bool receivePulse(const String& message) {
                             &sender, &reportId, &count27, &count35,
                             &rate27, &rate35, &extra);
   if (DEVICE_ID == 1 && parsed == 6 && sender == 2 &&
-      reportId > 0 && reportId <= 255) {
+      reportId <= 255) {  // Cero: ya hay tasa de 1 s, aun no cerro el primer bloque.
     peerPulseReportId = static_cast<uint8_t>(reportId);
     peerPulse1 = count27;
     peerPulse2 = count35;
@@ -1495,26 +1524,33 @@ String localBriefState(uint8_t channel) {
 }
 
 void reportBoard2Pulses() {
-  if (DEVICE_ID == 2) {
-    report("Pulsos placa 2: GPIO27=" +
+  if (DEVICE_ID == 2 && pulseRateReady) {
+    report("Pulsos placa 2 (1 s): GPIO27=" +
            String(localPulseRate1 / 10) + "." +
            String(localPulseRate1 % 10) + " p/s; GPIO35=" +
            String(localPulseRate2 / 10) + "." +
            String(localPulseRate2 % 10) + " p/s");
-    report("  Contador: GPIO27=" + String(localPulse1) +
-           " GPIO35=" + String(localPulse2));
-  } else if (peerPulseReportId != 0 && peerPulseReportId == latestPeerReportId &&
-             millis() - peerPulseReceivedAt <= PEER_STALE_MS) {
-    report("Pulsos placa 2: GPIO27=" +
+  } else if (DEVICE_ID == 1 && peerPulseReceivedAt != 0 &&
+             millis() - peerPulseReceivedAt <= 2500) {
+    report("Pulsos placa 2 (1 s): GPIO27=" +
            String(peerPulseRate1 / 10) + "." +
            String(peerPulseRate1 % 10) + " p/s; GPIO35=" +
            String(peerPulseRate2 / 10) + "." +
            String(peerPulseRate2 % 10) + " p/s");
-    report("  Contador: GPIO27=" + String(peerPulse1) +
-           " GPIO35=" + String(peerPulse2));
   } else {
-    report("Pulsos placa 2: sin dato reciente");
+    report("Pulsos placa 2 (1 s): sin dato reciente");
   }
+  if (DEVICE_ID == 2 && localReportId != 0)
+    report("  Contador (10 s): GPIO27=" + String(localPulse1) +
+           " GPIO35=" + String(localPulse2));
+  else if (DEVICE_ID == 1 && peerPulseReportId != 0 &&
+           peerPulseReportId == latestPeerReportId &&
+           millis() - latestPeerAt <= PEER_STALE_MS &&
+           millis() - peerPulseReceivedAt <= PEER_STALE_MS)
+    report("  Contador (10 s): GPIO27=" + String(peerPulse1) +
+           " GPIO35=" + String(peerPulse2));
+  else
+    report("  Contador (10 s): sin ventana reciente completa");
 }
 
 void printBriefStatus() {
@@ -1990,11 +2026,6 @@ void setup() {
   pinMode(RS485_DE_RE, OUTPUT);
   digitalWrite(RS485_DE_RE, LOW);
 
-  pinMode(PULSE_1, INPUT_PULLUP);
-  pinMode(PULSE_2, INPUT);
-  attachInterrupt(digitalPinToInterrupt(PULSE_1), onPulse1, RISING);
-  attachInterrupt(digitalPinToInterrupt(PULSE_2), onPulse2, RISING);
-
   SPI.begin(CAN_SCK, CAN_MISO, CAN_MOSI, CAN_CS);
   canController.reset();
   canController.setBitrate(CAN_250KBPS, MCP_8MHZ);
@@ -2002,11 +2033,20 @@ void setup() {
 
   bluetooth.begin("HWTEST-ESP32-" + String(DEVICE_ID));
   delay(300);
+  lastStatusAt = lastWindowCapturedAt = millis();
+  if (DEVICE_ID == 2) {
+    pulseRateSampleAt = lastStatusAt;
+    pinMode(PULSE_1, INPUT_PULLUP);
+    pinMode(PULSE_2, INPUT);  // GPIO35 no dispone de pull-up interno.
+    attachInterrupt(digitalPinToInterrupt(PULSE_1), onPulse1, RISING);
+    attachInterrupt(digitalPinToInterrupt(PULSE_2), onPulse2, RISING);
+  }
   report("HWTEST listo. Placa " + String(DEVICE_ID));
   report("Conecte ambas placas y use STATUS o HELP");
 }
 
 void loop() {
+  samplePulseRate();
   pollBluetooth();
   pollLink(ttl1, ttl1Buffer, ttl1Stats, false);
   pollLink(ttl2, ttl2Buffer, ttl2Stats, false);
