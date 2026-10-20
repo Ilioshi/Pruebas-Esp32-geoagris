@@ -3,6 +3,8 @@
 #include <SPI.h>
 #include <mcp2515.h>
 #include <deque>
+#include <esp_system.h>
+#include <driver/uart.h>
 
 #ifndef DEVICE_ID
 #define DEVICE_ID 1
@@ -86,18 +88,8 @@ String ttl1Buffer;
 String ttl2Buffer;
 String rs485Buffer;
 uint32_t rs485Nulos = 0;
-String rs485WindowSampleHex;
-uint32_t rs485WindowSampleBytes = 0;
-String rs485ReportSampleHex;
-uint32_t rs485ReportSampleBytes = 0;
-struct PeerRs485Sample {
-  uint8_t reportId = 0;
-  uint32_t bytes = 0;
-  String hex;
-  uint32_t receivedAt = 0;
-};
-PeerRs485Sample peerRs485Sample;
 struct Rs485ReportTrace {
+  uint8_t requestId = 0;
   uint8_t reportId = 0;
   bool started = false;
   bool txReported = false;
@@ -234,7 +226,13 @@ ReportReceipt peerReceipts[CHANNEL_COUNT];
 uint32_t receiptDue = 0;
 std::deque<String> diagnosticQueue;
 std::deque<String> bluetoothQueue;
-uint32_t diagnosticNextAt = 0;
+uint32_t auxRs485QuietUntil = 0;
+bool auxRs485Busy();
+void queueWindowDiagnostics();
+void queueDetailedDiagnostics(uint8_t mask);
+void queueDetail(const String& text);
+String auxChecked(const String& text);
+extern std::deque<String> diagnosticDetailQueue;
 uint32_t bluetoothNextAt = 0;
 uint32_t diagnosticRejected = 0;
 uint32_t diagnosticDropped = 0;
@@ -256,12 +254,10 @@ uint8_t localReportId = 0;
 uint8_t latestPeerReportId = 0;
 uint32_t latestPeerAt = 0;
 uint32_t latestPeerFirstAt = 0;
-uint8_t rs485ScheduledFor = 0;
 uint32_t rs485ReportDue = 0;
-bool rs485AwaitingReady = false;
-uint8_t rs485ReadyReportId = 0;
-uint8_t rs485AnnouncedReportId = 0;
+uint8_t rs485RequestId = 0;
 bool rs485PingDeferred = false;
+bool rs485InfoDue = false;
 ChannelWindow canInfoWindows[CHANNEL_COUNT];
 uint8_t canInfoReportId = 0;
 uint8_t canInfoNextChannel = 0;
@@ -269,6 +265,14 @@ uint32_t canInfoQueuedAt = 0;
 uint32_t canInfoNextSendAt = 0;
 uint32_t canInfoDropped = 0;
 bool canInfoPending = false;
+bool canInfoCrcPending = false;
+struct can_frame canInfoCrcFrame{};
+struct PendingCanInfo {
+  struct can_frame frame{};
+  uint8_t reportId = 0;
+  uint32_t receivedAt = 0;
+};
+PendingCanInfo pendingCanInfo[CHANNEL_COUNT];
 uint32_t statusPrintDue = 0;
 
 void IRAM_ATTR onPulse1() { ++pulse1; }
@@ -305,7 +309,7 @@ uint16_t diagnosticCrc(const String& text) {
 void sendDiagnostic(const String& text, bool urgent = false) {
   char checksum[6];
   snprintf(checksum, sizeof(checksum), "*%04X", diagnosticCrc(text));
-  if (diagnosticQueue.size() >= 512) {
+  if (diagnosticQueue.size() >= 64) {
     ++diagnosticDropped;
     return;
   }
@@ -313,15 +317,7 @@ void sendDiagnostic(const String& text, bool urgent = false) {
   else diagnosticQueue.push_back(text + checksum);
 }
 
-void processDiagnosticOutput() {
-  if (diagnosticQueue.empty() ||
-      static_cast<int32_t>(millis() - diagnosticNextAt) < 0) return;
-  const String& text = diagnosticQueue.front();
-  if (ttl1.availableForWrite() < static_cast<int>(text.length() + 130)) return;
-  ttl1.println(text);
-  diagnosticQueue.pop_front();
-  diagnosticNextAt = millis() + 15;
-}
+void processDiagnosticOutput();
 
 void sendPulseSample() {
   if (DEVICE_ID != 2 || !pulseRateReady) return;
@@ -360,8 +356,7 @@ void samplePulseRate() {
 bool isDiagnostic(const String& text) {
   return text.startsWith("FLOW,") || text.startsWith("CMP,") ||
          text.startsWith("PULSE,") || text.startsWith("TRACE,") ||
-         text.startsWith("RRX,") || text.startsWith("RBEGIN,") ||
-         text.startsWith("RREADY,") || text.startsWith("RTX,") ||
+         text.startsWith("RTX,") ||
          text.startsWith("RCPT,");
 }
 
@@ -510,28 +505,50 @@ bool validHexText(const String& input) {
   return true;
 }
 
+void recordTestByte(Stream& port, LinkStats& stats, uint8_t value) {
+  ++stats.rawBytes;
+  rememberRawByte(stats, value);
+  if (&port == static_cast<Stream*>(&ttl1))
+    traceByte(rxTraceNow[0], value);
+  else if (&port == static_cast<Stream*>(&ttl2))
+    traceByte(rxTraceNow[1], value);
+  else if (&port == static_cast<Stream*>(&rs485))
+    traceByte(rxTraceNow[2], value);
+  if (&port == static_cast<Stream*>(&rs485)) {
+    if (DEVICE_ID == 1 && rs485ReportTrace.started &&
+        !rs485ReportTrace.complete) {
+      ++rs485ReportTrace.rxBytes;
+      appendHexByte(rs485ReportTrace.receivedHex, value,
+                    RS485_SAMPLE_MAX_BYTES);
+    }
+  }
+}
+
 bool readLine(Stream& port, String& buffer, String& line, LinkStats& stats) {
   while (port.available()) {
     const char c = static_cast<char>(port.read());
-    ++stats.rawBytes;
-    rememberRawByte(stats, static_cast<uint8_t>(c));
-    if (&port == static_cast<Stream*>(&ttl1))
-      traceByte(rxTraceNow[0], static_cast<uint8_t>(c));
-    else if (&port == static_cast<Stream*>(&ttl2))
-      traceByte(rxTraceNow[1], static_cast<uint8_t>(c));
-    else if (&port == static_cast<Stream*>(&rs485))
-      traceByte(rxTraceNow[2], static_cast<uint8_t>(c));
-    if (&port == static_cast<Stream*>(&rs485)) {
-      ++rs485WindowSampleBytes;
-      appendHexByte(rs485WindowSampleHex, static_cast<uint8_t>(c),
-                    RS485_SAMPLE_MAX_BYTES);
-      if (DEVICE_ID == 1 && rs485ReportTrace.started &&
-          !rs485ReportTrace.complete) {
-        ++rs485ReportTrace.rxBytes;
-        appendHexByte(rs485ReportTrace.receivedHex, static_cast<uint8_t>(c),
-                      RS485_SAMPLE_MAX_BYTES);
-      }
+    if (&port == static_cast<Stream*>(&rs485) && c == '\0' && buffer.length() == 0) {
+      // NUL de conmutacion no cambia la clasificacion del prefijo de la proxima linea.
+      recordTestByte(port, stats, 0);
+      ++rs485Nulos;
+      continue;
     }
+    const uint8_t channel = &port == static_cast<Stream*>(&ttl1) ? 0 :
+                            &port == static_cast<Stream*>(&ttl2) ? 1 : 2;
+    static String prefixes[3];
+    static uint8_t modes[3]{};  // 0: prefijo pendiente; 1: prueba; 2: AUX.
+    if (modes[channel] == 0) {
+      prefixes[channel] += c;
+      if (!String("DX,").startsWith(prefixes[channel]) ||
+          prefixes[channel].length() == 3 || c == '\n') {
+        modes[channel] = prefixes[channel] == "DX," ? 2 : 1;
+        if (modes[channel] == 1)
+          for (size_t i = 0; i < prefixes[channel].length(); ++i)
+            recordTestByte(port, stats, static_cast<uint8_t>(prefixes[channel][i]));
+        prefixes[channel] = "";
+      }
+    } else if (modes[channel] == 1) recordTestByte(port, stats, static_cast<uint8_t>(c));
+    if (c == '\n') { modes[channel] = 0; prefixes[channel] = ""; }
     if (&port == static_cast<Stream*>(&rs485) && c == '\0') {
       ++rs485Nulos;
       if (buffer.length() > 0)
@@ -611,10 +628,6 @@ void captureAllWindows() {
     rxTraceNow[channel] = RawTrace{};
     txTraceNow[channel] = RawTrace{};
   }
-  rs485ReportSampleHex = rs485WindowSampleHex;
-  rs485ReportSampleBytes = rs485WindowSampleBytes;
-  rs485WindowSampleHex = "";
-  rs485WindowSampleBytes = 0;
   captureWindow(0, ttl1Stats.sent, ttl1Stats.received, ttl1Stats.ok,
                 ttl1Stats.errors, ttl1Stats.rawBytes, ttl1Stats.invalidLines);
   captureWindow(1, ttl2Stats.sent, ttl2Stats.received, ttl2Stats.ok,
@@ -701,58 +714,79 @@ void sendInfoSerial(HardwareSerial& port, bool halfDuplex) {
   }
   for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
     const String line = infoLine(channel);
-    infoBytesSent[via] += port.println(line);
-    traceLine(txTraceNow[via], line);
+    const String checked = auxChecked(line);
+    infoBytesSent[via] += port.println(checked);
+    traceLine(txTraceNow[via], checked);
   }
-  // El desglose y la ultima comparacion de cada canal viajan por TTL1.
-  if (&port == &ttl1) {
-    for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel)
-      sendDiagnostic(flowLine(channel));
-    sendPulseSample();
-    if (DEVICE_ID == 2)
-      sendDiagnostic("RRX,2," + String(localReportId) + "," +
-                   String(rs485ReportSampleBytes) + "," +
-                   (rs485ReportSampleHex.length() ? rs485ReportSampleHex : "-"));
-    for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
-      for (uint8_t kind = 0; kind < 1; ++kind) {
-        const FrameComparison& frame = localComparison[channel][kind];
-        if (!frame.seen) {
-          sendDiagnostic("CMP," + String(DEVICE_ID) + "," + String(localReportId) +
-                         "," + String(channel) + ",0,0,-,-");
-          continue;
-        }
-        sendDiagnostic("CMP," + String(DEVICE_ID) + "," + String(localReportId) +
-                     "," + String(channel) + "," + String(kind) + "," +
-                     String(frame.verdict) + "," + toHex(frame.expected) +
-                     "," + toHex(frame.received));
-      }
-    }
-    for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
-      const RawTrace* traces[] = {&txTraceWindow[channel],
-                                  &rxTraceWindow[channel]};
-      for (uint8_t direction = 0; direction < 2; ++direction) {
-        const RawTrace& trace = *traces[direction];
-        size_t offset = 0;
-        do {
-          const String chunk = trace.hex.substring(offset * 2,
-            (offset + TRACE_CHUNK_BYTES) * 2);
-          const bool last = (offset * 2 + chunk.length()) == trace.hex.length();
-          sendDiagnostic("TRACE," + String(DEVICE_ID) + "," +
-                         String(localReportId) + "," + String(channel) + "," +
-                         (direction == 0 ? "T" : "R") + "," +
-                         String(trace.count) + "," + String(offset) + "," +
-                         (last ? "1" : "0") + "," +
-                         (chunk.length() ? chunk : "-"));
-          offset += chunk.length() / 2;
-          if (last) break;
-        } while (offset * 2 < trace.hex.length());
-      }
-    }
-  }
+
   if (halfDuplex) {
+    if (DEVICE_ID == 1) port.println(auxChecked("IREQ,1," + String(localReportId)));
     port.flush();
     delayMicroseconds(100);
     digitalWrite(RS485_DE_RE, LOW);
+    if (DEVICE_ID == 1) {
+      // Reserva para los cuatro INFO de placa 2: no depende de TTL1 ni de AUX.
+      auxRs485QuietUntil = millis() + 800;
+      rs485ReportTrace = Rs485ReportTrace{};
+      rs485ReportTrace.requestId = localReportId;
+      rs485ReportTrace.started = true;
+      rs485ReportTrace.startedAt = millis();
+    }
+  }
+}
+
+void queueDetail(const String& text) {
+  if (diagnosticDetailQueue.size() >= 160) { ++diagnosticDropped; return; }
+  diagnosticDetailQueue.push_back(auxChecked(text));
+}
+
+void queueWindowDiagnostics() {
+  // Sustituir FLOW antiguos aun no transmitidos; la ventana en vuelo se conserva.
+  for (auto it = diagnosticQueue.begin(); it != diagnosticQueue.end();) {
+    if (it->startsWith("FLOW,")) it = diagnosticQueue.erase(it);
+    else ++it;
+  }
+  for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel)
+    sendDiagnostic(flowLine(channel));
+}
+
+void queueDetailedDiagnostics(uint8_t mask) {
+  for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
+    if (!(mask & (1 << channel))) continue;
+    for (uint8_t kind = 0; kind < 1; ++kind) {
+      const FrameComparison& frame = localComparison[channel][kind];
+      if (!frame.seen) {
+        queueDetail("CMP," + String(DEVICE_ID) + "," + String(localReportId) +
+                       "," + String(channel) + ",0,0,-,-");
+        continue;
+      }
+      queueDetail("CMP," + String(DEVICE_ID) + "," + String(localReportId) +
+                   "," + String(channel) + "," + String(kind) + "," +
+                   String(frame.verdict) + "," + toHex(frame.expected) +
+                   "," + toHex(frame.received));
+    }
+  }
+  for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
+    if (!(mask & (1 << channel))) continue;
+    const RawTrace* traces[] = {&txTraceWindow[channel],
+                                &rxTraceWindow[channel]};
+    for (uint8_t direction = 0; direction < 2; ++direction) {
+      const RawTrace& trace = *traces[direction];
+      size_t offset = 0;
+      do {
+        const String chunk = trace.hex.substring(offset * 2,
+          (offset + TRACE_CHUNK_BYTES) * 2);
+        const bool last = (offset * 2 + chunk.length()) == trace.hex.length();
+        queueDetail("TRACE," + String(DEVICE_ID) + "," +
+                       String(localReportId) + "," + String(channel) + "," +
+                       (direction == 0 ? "T" : "R") + "," +
+                       String(trace.count) + "," + String(offset) + "," +
+                       (last ? "1" : "0") + "," +
+                       (chunk.length() ? chunk : "-"));
+        offset += chunk.length() / 2;
+        if (last) break;
+      } while (offset * 2 < trace.hex.length());
+    }
   }
 }
 
@@ -767,6 +801,7 @@ void sendInfoCan() {
   // a la vez los dos buffers RX del MCP2515 del equipo opuesto.
   canInfoNextSendAt = canInfoQueuedAt +
     (DEVICE_ID == 1 ? CAN_INFO_START_BOARD_1_MS : CAN_INFO_START_BOARD_2_MS);
+  canInfoCrcPending = false;
   canInfoPending = true;
 }
 
@@ -780,6 +815,15 @@ void processCanInfoQueue() {
   }
   if (static_cast<int32_t>(now - canInfoNextSendAt) < 0) return;
 
+  if (canInfoCrcPending) {
+    if (canController.sendMessage(&canInfoCrcFrame) != MCP2515::ERROR_OK) return;
+    traceCanFrame(txTraceNow[3], canInfoCrcFrame);
+    infoBytesSent[3] += canInfoCrcFrame.can_dlc;
+    canInfoCrcPending = false;
+    if (++canInfoNextChannel == CHANNEL_COUNT) canInfoPending = false;
+    else canInfoNextSendAt = now + CAN_INFO_GAP_MS;
+    return;
+  }
   const uint8_t channel = canInfoNextChannel;
   const ChannelWindow& w = canInfoWindows[channel];
   struct can_frame frame{};
@@ -796,12 +840,19 @@ void processCanInfoQueue() {
   if (canController.sendMessage(&frame) != MCP2515::ERROR_OK) return;
   traceCanFrame(txTraceNow[3], frame);
   infoBytesSent[3] += frame.can_dlc;
-  ++canInfoNextChannel;
-  if (canInfoNextChannel == CHANNEL_COUNT) {
-    canInfoPending = false;
-  } else {
-    canInfoNextSendAt = now + CAN_INFO_GAP_MS;
-  }
+  canInfoCrcFrame = can_frame{};
+  canInfoCrcFrame.can_id = 0x510 + DEVICE_ID;
+  canInfoCrcFrame.can_dlc = 4;
+  canInfoCrcFrame.data[0] = canInfoReportId;
+  canInfoCrcFrame.data[1] = channel;
+  const String canonical = "INFO," + String(DEVICE_ID) + "," + String(canInfoReportId) +
+    "," + String(channel) + "," + String(w.tx) + "," + String(w.rx) + "," +
+    String(w.ok) + "," + String(w.errors) + "," + String(w.raw) + "," + String(w.invalid);
+  const uint16_t crc = diagnosticCrc(canonical);
+  canInfoCrcFrame.data[2] = crc & 0xFF;
+  canInfoCrcFrame.data[3] = crc >> 8;
+  canInfoCrcPending = true;
+  canInfoNextSendAt = now + 12;
 }
 
 void storePeerCopy(uint8_t via, uint8_t channel, uint8_t reportId,
@@ -818,19 +869,7 @@ void storePeerCopy(uint8_t via, uint8_t channel, uint8_t reportId,
     receiptDue = now + REPORT_SETTLE_MS;
   }
   if (reportId == latestPeerReportId) latestPeerAt = now;
-  // La placa 2 transmite su resumen por RS485 aunque el pedido solo haya
-  // llegado por otro enlace; el retardo evita solaparlo con el envio de placa 1.
-  if (DEVICE_ID == 2 && channel == CHANNEL_COUNT - 1 &&
-      rs485ScheduledFor != reportId) {
-    if (localReportId == 0) {
-      captureAllWindows();
-      sendInfoSerial(ttl1, false);
-      sendInfoSerial(ttl2, false);
-      sendInfoCan();
-    }
-    rs485ScheduledFor = reportId;
-    rs485ReportDue = now + 500;
-  }
+
 }
 
 bool receiveInfo(const String& message, uint8_t via, const String& expected) {
@@ -856,7 +895,8 @@ bool receiveInfo(const String& message, uint8_t via, const String& expected) {
   rememberComparison(via, kind, expected, message,
                      !expected.length() ? 4 : (expected != message ? 2 : 1),
                      reportId);
-  infoBytesReceived[via] += message.length() + 2;  // println agrega CR+LF.
+  // UART: texto + CRC (*FFFF) + CR/LF; CAN: datos (8) + CRC asociado (4).
+  infoBytesReceived[via] += via == 3 ? 12 : message.length() + 7;
   storePeerCopy(via, channel, static_cast<uint8_t>(reportId),
                 makeWindow(static_cast<uint8_t>(tx), static_cast<uint8_t>(rx),
                            static_cast<uint8_t>(ok), static_cast<uint8_t>(errors),
@@ -1065,62 +1105,18 @@ void processReceipts() {
 }
 
 bool receiveRs485Trace(const String& message) {
-  if (message.startsWith("RRX,")) {
-    unsigned long sender = 0, reportId = 0, bytes = 0;
-    char hex[RS485_SAMPLE_MAX_BYTES * 2 + 2]{};
-    char extra;
-    const int parsed = sscanf(message.c_str(), "RRX,%lu,%lu,%lu,%257s%c",
-                              &sender, &reportId, &bytes, hex, &extra);
-    const String sample = hex;
-    if (DEVICE_ID == 1 && parsed == 4 && sender == 2 &&
-        reportId > 0 && reportId <= 255 &&
-        (sample == "-" || (sample.length() <= RS485_SAMPLE_MAX_BYTES * 2 &&
-         validHexText(sample)))) {
-      peerRs485Sample.reportId = static_cast<uint8_t>(reportId);
-      peerRs485Sample.bytes = bytes;
-      peerRs485Sample.hex = sample == "-" ? "" : sample;
-      peerRs485Sample.receivedAt = millis();
-    }
-    return true;
-  }
-  if (message.startsWith("RBEGIN,")) {
-    unsigned long sender = 0, reportId = 0;
-    char extra;
-    if (DEVICE_ID == 1 &&
-        sscanf(message.c_str(), "RBEGIN,%lu,%lu%c", &sender, &reportId,
-               &extra) == 2 && sender == 2 && reportId > 0 && reportId <= 255) {
-      rs485ReportTrace = Rs485ReportTrace{};
-      rs485ReportTrace.reportId = static_cast<uint8_t>(reportId);
-      rs485ReportTrace.started = true;
-      rs485ReportTrace.startedAt = millis();
-      sendDiagnostic("RREADY,1," + String(reportId), true);
-    }
-    return true;
-  }
-  if (message.startsWith("RREADY,")) {
-    unsigned long sender = 0, reportId = 0;
-    char extra;
-    if (DEVICE_ID == 2 &&
-        sscanf(message.c_str(), "RREADY,%lu,%lu%c", &sender, &reportId,
-               &extra) == 2 && sender == 1 &&
-        reportId == rs485AnnouncedReportId)
-      rs485ReadyReportId = static_cast<uint8_t>(reportId);
-    return true;
-  }
   if (message.startsWith("RTX,")) {
-    unsigned long sender = 0, reportId = 0, bytes = 0;
+    unsigned long sender = 0, reportId = 0, requestId = 0, bytes = 0;
     char hex[401]{};
     char extra;
-    const int parsed = sscanf(message.c_str(), "RTX,%lu,%lu,%lu,%400[0-9A-F]%c",
-                              &sender, &reportId, &bytes, hex, &extra);
+    const int parsed = sscanf(message.c_str(), "RTX,%lu,%lu,%lu,%lu,%400[0-9A-F]%c",
+                              &sender, &reportId, &requestId, &bytes, hex, &extra);
     const String expected = hex;
-    if (DEVICE_ID == 1 && parsed == 4 && sender == 2 &&
+    if (DEVICE_ID == 1 && parsed == 5 && sender == 2 &&
+        requestId == rs485ReportTrace.requestId && rs485ReportTrace.started &&
         reportId > 0 && reportId <= 255 && expected.length() > 0 &&
         expected.length() % 2 == 0) {
-      if (rs485ReportTrace.reportId != reportId) {
-        rs485ReportTrace = Rs485ReportTrace{};
-        rs485ReportTrace.reportId = static_cast<uint8_t>(reportId);
-      }
+      rs485ReportTrace.reportId = static_cast<uint8_t>(reportId);
       rs485ReportTrace.txReported = true;
       rs485ReportTrace.txReportedAt = millis();
       rs485ReportTrace.txBytes = bytes;
@@ -1130,6 +1126,8 @@ bool receiveRs485Trace(const String& message) {
   }
   return false;
 }
+
+#include "diagnostic_transport.h"
 
 void sendLine(HardwareSerial& port, LinkStats& stats, const String& message) {
   port.println(message);
@@ -1168,7 +1166,20 @@ String expectedInfoLine(uint8_t via, const String& message) {
 
 bool handleLinkMessage(HardwareSerial& port, LinkStats& stats, String message, bool halfDuplex) {
   const uint8_t via = &stats == &ttl1Stats ? 0 : (&stats == &ttl2Stats ? 1 : 2);
-  if (isDiagnostic(message) && (via != 0 || !verifyDiagnostic(message))) {
+  if (auxReceivePacket(message, via)) return true;
+  if (message.startsWith("IREQ,")) {
+    unsigned long sender = 0, id = 0;
+    char extra;
+    if (!halfDuplex || !verifyDiagnostic(message) ||
+        sscanf(message.c_str(), "IREQ,%lu,%lu%c", &sender, &id, &extra) != 2 ||
+        sender != 1 || id == 0 || id > 255) { ++diagnosticRejected; return true; }
+    if (DEVICE_ID == 2 && localReportId) {
+      rs485RequestId = static_cast<uint8_t>(id);
+      rs485ReportDue = millis() + 20;
+    }
+    return true;
+  }
+  if ((isDiagnostic(message) || message.startsWith("INFO,")) && !verifyDiagnostic(message)) {
     ++diagnosticRejected;
     return true;
   }
@@ -1291,54 +1302,48 @@ String canFrameText(const struct can_frame& frame) {
   return result;
 }
 
+String peerInfoText(uint8_t channel, const PeerCopy& copy);
+
 void pollCan() {
   struct can_frame frame{};
   while (canController.readMessage(&frame) == MCP2515::ERROR_OK) {
+    if (auxReceiveCan(frame)) continue;
     traceCanFrame(rxTraceNow[3], frame);
     const uint32_t peerInfoBase = DEVICE_ID == 1 ? 0x400 : 0x300;
     if (frame.can_id > peerInfoBase && frame.can_id <= peerInfoBase + 255) {
-      const uint8_t reportId = static_cast<uint8_t>(frame.can_id - peerInfoBase);
-      const bool valid = frame.can_dlc == 8 && frame.data[0] == 0xD2 &&
-                         frame.data[1] < CHANNEL_COUNT;
-      String expected;
-      uint8_t verdict = valid ? 4 : 3;
-      if (valid) {
-        const uint8_t channel = frame.data[1];
-        const PeerCopy* first = nullptr;
-        for (uint8_t referenceVia = 0; referenceVia < CHANNEL_COUNT; ++referenceVia) {
-          if (referenceVia == 3) continue;
-          const PeerCopy& reference = peerCopies[referenceVia][channel];
-          if (reference.reportId != reportId ||
-              millis() - reference.receivedAt > PEER_STALE_MS) continue;
-          if (!first || millis() - reference.receivedAt >
-                        millis() - first->receivedAt) first = &reference;
-        }
-        if (first) {
-          const PeerCopy& reference = *first;
-          struct can_frame referenceFrame{};
-          referenceFrame.can_id = frame.can_id;
-          referenceFrame.can_dlc = 8;
-          referenceFrame.data[0] = 0xD2;
-          referenceFrame.data[1] = channel;
-          referenceFrame.data[2] = reference.window.tx;
-          referenceFrame.data[3] = reference.window.rx;
-          referenceFrame.data[4] = reference.window.ok;
-          referenceFrame.data[5] = reference.window.errors;
-          referenceFrame.data[6] = reference.window.raw;
-          referenceFrame.data[7] = reference.window.invalid;
-          expected = canFrameText(referenceFrame);
-          verdict = expected == canFrameText(frame) ? 1 : 2;
-        }
-        rememberComparison(3, 1 + channel, expected, canFrameText(frame),
-                           verdict, reportId);
-        infoBytesReceived[3] += frame.can_dlc;
-        storePeerCopy(3, channel, reportId,
-                      makeWindow(frame.data[2], frame.data[3], frame.data[4],
-                                 frame.data[5], frame.data[6], frame.data[7]));
-      } else {
-        rememberComparison(3, 1, "CAN INFO ID/DLC=8 DATA=D2 canal + 6 datos",
-                           canFrameText(frame), verdict, reportId);
+      if (frame.can_dlc == 8 && frame.data[0] == 0xD2 && frame.data[1] < CHANNEL_COUNT) {
+        PendingCanInfo& pending = pendingCanInfo[frame.data[1]];
+        pending.frame = frame;
+        pending.reportId = frame.can_id - peerInfoBase;
+        pending.receivedAt = millis();
+      } else ++diagnosticRejected;
+      continue;
+    }
+    if (frame.can_id == 0x510 + (DEVICE_ID == 1 ? 2 : 1)) {
+      if (frame.can_dlc != 4 || frame.data[1] >= CHANNEL_COUNT) {
+        ++diagnosticRejected;
+        continue;
       }
+      PendingCanInfo& pending = pendingCanInfo[frame.data[1]];
+      if (pending.reportId != frame.data[0] || !pending.reportId ||
+          millis() - pending.receivedAt > CAN_INFO_TIMEOUT_MS) {
+        ++diagnosticRejected;
+        continue;
+      }
+      const uint8_t channel = frame.data[1];
+      const uint8_t* d = pending.frame.data;
+      PeerCopy copy;
+      copy.reportId = pending.reportId;
+      copy.window = makeWindow(d[2], d[3], d[4], d[5], d[6], d[7]);
+      const String text = peerInfoText(channel, copy);
+      const uint16_t receivedCrc = frame.data[2] | (frame.data[3] << 8);
+      if (diagnosticCrc(text) == receivedCrc) {
+        receiveInfo(text, 3, expectedInfoLine(3, text));
+      } else {
+        ++diagnosticRejected;
+        rememberComparison(3, 1 + channel, "INFO con CRC valido", text, 3, copy.reportId);
+      }
+      pending = PendingCanInfo{};
       continue;
     }
     if (frame.can_id != static_cast<uint32_t>(0x100 + (DEVICE_ID == 1 ? 2 : 1))) {
@@ -1409,7 +1414,7 @@ void reportComparison(const String& name, const FrameComparison* frame) {
     report("  " + name + ": " +
            (latestPeerReportId && millis() - latestPeerFirstAt < REPORT_SETTLE_MS ?
             "comparacion auxiliar en camino" :
-            "sin comparacion auxiliar reciente (TTL1)"));
+            "sin comparacion auxiliar reciente; consultar el canal para solicitarla"));
     return;
   }
   if (!frame->seen) {
@@ -1486,43 +1491,6 @@ String briefState(uint8_t channel, uint8_t device, const ChannelWindow& w) {
 
 const PeerCopy* currentPeerCopy(uint8_t channel);
 
-String localBriefState(uint8_t channel) {
-  const ChannelWindow& local = localWindow[channel];
-  const PeerCopy* peer = currentPeerCopy(channel);
-  if (channel < 2 && peer && (local.errors > 0 || peer->window.errors > 0)) {
-    const ChannelWindow& board2 = DEVICE_ID == 2 ? local : peer->window;
-    const ChannelWindow& board1 = DEVICE_ID == 1 ? local : peer->window;
-    const FlowWindow* board1Flow = DEVICE_ID == 1 ? &localFlow[channel] :
-      (peerFlow[channel].reportId == latestPeerReportId ? &peerFlow[channel].window : nullptr);
-    const FlowWindow* board2Flow = DEVICE_ID == 2 ? &localFlow[channel] :
-      (peerFlow[channel].reportId == latestPeerReportId ? &peerFlow[channel].window : nullptr);
-    const bool rx1Ok = board1Flow ? board1Flow->pingRx > 0 : board1.rx > 0;
-    const bool rx2Ok = board2Flow ? board2Flow->pingRx > 0 : board2.rx > 0;
-    if (DEVICE_ID == 1) {
-      if (rx1Ok && !rx2Ok) return "placa 2 RX falla (no PING); TX OK";
-      if (!rx1Ok && rx2Ok) return "RX sin respuesta; TX OK";
-      if (!rx1Ok && !rx2Ok) return "RX sin respuesta; TX sin respuesta";
-      return "RX OK; TX/PONG sin confirmar";
-    }
-    if (rx2Ok && !rx1Ok) return "RX OK; TX sin respuesta";
-    if (!rx2Ok && rx1Ok) return "placa 2 RX falla (no PING); TX OK";
-    if (!rx2Ok && !rx1Ok) return "RX sin respuesta; TX sin respuesta";
-    return "RX OK; TX/PONG sin confirmar";
-  }
-  if (channel == 2 && peer &&
-      (DEVICE_ID == 1 ? local.errors : peer->window.errors) > 0) {
-    const ChannelWindow& board2 = DEVICE_ID == 2 ? local : peer->window;
-    const ChannelWindow& board1 = DEVICE_ID == 1 ? local : peer->window;
-    if (board2.raw == 0) return "placa 2 RX sin PING; sin PONG";
-    if (board2.rx == 0) return "placa 2 RX datos no validos; sin PONG";
-    if (board1.ok > 0)
-      return "INTERMITENTE: " + String(board1.errors) +
-             " PING de placa 1 sin PONG; otros OK";
-    return "placa 2 RX OK; ningun PONG confirmado en placa 1";
-  }
-  return briefState(channel, DEVICE_ID, local);
-}
-
 void reportBoard2Pulses() {
   if (DEVICE_ID == 2 && pulseRateReady) {
     report("Pulsos placa 2 (1 s): GPIO27=" +
@@ -1561,7 +1529,7 @@ void printBriefStatus() {
   } else {
     for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel)
       report(String(CHANNEL_NAMES[channel]) + ": " +
-             localBriefState(channel));
+             briefState(channel, DEVICE_ID, localWindow[channel]));
   }
   reportBoard2Pulses();
   report("------------------------------");
@@ -1611,7 +1579,7 @@ void reportPeerCopyMatrix() {
   for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
     const PeerCopy* first = firstPeerCopy(channel);
     if (first)
-      report("  Referencia " + String(CHANNEL_NAMES[channel]) + ": " +
+      report("  Referencia provisional " + String(CHANNEL_NAMES[channel]) + ": " +
              peerInfoText(channel, *first));
   }
   for (uint8_t via = 0; via < CHANNEL_COUNT; ++via) {
@@ -1744,8 +1712,12 @@ void reportBothBoards(uint8_t channel, bool detailed) {
     else {
       const PeerCopy* copy = currentPeerCopy(channel);
       const PeerFrameComparison& peer = peerComparison[channel][0];
-      if (copy && peer.reportId == copy->reportId &&
-          millis() - peer.receivedAt <= PEER_STALE_MS) frame = &peer.frame;
+      if (peer.reportId && millis() - peer.receivedAt <= AUX_CAPTURE_MS) {
+        if (copy && copy->reportId == peer.reportId) frame = &peer.frame;
+        else if (detailed)
+          reportComparison("Comparacion remota conservada, informe " + String(peer.reportId),
+                           &peer.frame);
+      }
     }
     reportWindow(channel, board, *window, boardFlow(board, channel), frame);
     if (detailed && (!frame || !frame->seen ||
@@ -1781,7 +1753,7 @@ void reportInfoDirections(uint8_t channel) {
         else
           summary += "informe " + String(localReportId) + ", confirmacion " +
                      (millis() - lastWindowCapturedAt < REPORT_SETTLE_MS + 3000 ?
-                      "en camino" : "no recibida por TTL1");
+                      "en camino" : "no recibida por via auxiliar");
       }
     } else if (latestPeerReportId && millis() - latestPeerAt <= PEER_STALE_MS) {
       const uint8_t count = maskCount(receivedInfoMask(channel, latestPeerReportId));
@@ -1806,6 +1778,7 @@ void reportDiagnosticHealth() {
 void printDetails() {
   report("********************************");
   report("DATOS - ultimos 10 s");
+  reportAuxTransport();
   if (!automaticTestsEnabled) report("PRUEBAS DETENIDAS");
   for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
     report("======== " + String(CHANNEL_NAMES[channel]) + " ========");
@@ -1831,7 +1804,7 @@ void reportRawTrace(uint8_t channel, const char* direction,
   const String label = String(direction) +
                        (reportId ? " (informe " + String(reportId) + ")" : "");
   if (!trace) {
-    report(label + ": sin muestra reciente (via TTL1)");
+    report(label + ": sin captura solicitada reciente; consultar canal o RAW");
     return;
   }
   if (channel == 3) {
@@ -1880,10 +1853,10 @@ void reportBoardRaw(uint8_t channel, uint8_t board, bool withTx) {
   const PeerRawTrace& tx = peerTxTrace[channel];
   const PeerRawTrace& rx = peerRxTrace[channel];
   if (withTx) reportRawTrace(channel, "TX",
-    tx.reportId && millis() - tx.receivedAt <= PEER_STALE_MS ? &tx.trace : nullptr,
+    tx.reportId && millis() - tx.receivedAt <= AUX_CAPTURE_MS ? &tx.trace : nullptr,
     tx.reportId);
   reportRawTrace(channel, "RX",
-    rx.reportId && millis() - rx.receivedAt <= PEER_STALE_MS ? &rx.trace : nullptr,
+    rx.reportId && millis() - rx.receivedAt <= AUX_CAPTURE_MS ? &rx.trace : nullptr,
     rx.reportId);
 }
 
@@ -1909,7 +1882,7 @@ void reportChannelCopies(uint8_t via) {
       latestPeerReportId != 0 && saved.seen && saved.verdict == 3 &&
       saved.reportId == latestPeerReportId ? &saved : nullptr;
     report("  " + String(CHANNEL_NAMES[channel]) + ": " +
-           (received ? (reference == &copy ? "REFERENCIA" :
+           (received ? (reference == &copy ? "REFERENCIA PROVISIONAL" :
                         reference && sameWindow(reference->window, copy.window)
                         ? "IGUAL" : "DIFERENTE") :
             malformed ? "TRAMA INVALIDA" :
@@ -1929,6 +1902,7 @@ void printChannelDetails(uint8_t channel) {
   report("********************************");
   report(String(CHANNEL_NAMES[channel]) +
          " - DIAGNOSTICO COMPLETO (ultimos 10 s)");
+  reportAuxTransport();
   reportBothBoards(channel, true);
   reportInfoDirections(channel);
   report("======== TX/RX CRUDOS ========");
@@ -1947,7 +1921,9 @@ void printHelp() {
   report("COMANDOS: STATUS, DATOS, TTL1, TTL2, RS485, CAN, RAW, RUN, STOP, HELP");
   report("STATUS: resumen local; DATOS o DATA: detalle y placa remota");
   report("TTL1/TTL2/RS485/CAN: tramas y lecturas crudas por canal");
-  report("RAW: RX de los 4 canales y ambas placas; RUN/STOP: iniciar o detener");
+  report("RAW: solicita RX remoto; TTL1/TTL2/RS485/CAN solicitan detalle remoto");
+  report("El detalle remoto se imprime al terminar; se conserva hasta 120 s con su informe");
+  report("RUN/STOP: reanudar/detener envios locales de prueba; diagnostico sigue activo");
   report("DATOS: PING y PONG separados; PONG correctos confirma ida y vuelta");
   report("UART0/TTL2 usa GPIO3/1: desconectar USB durante la prueba");
 }
@@ -1955,7 +1931,7 @@ void printHelp() {
 void printData() {
   report("********************************");
   report("RAW - RX DE AMBAS PLACAS");
-  report("Ultima ventana disponible; incluye datos invalidos y auxiliares");
+  report("Ventanas identificadas por informe; incluye invalidos e INFO, excluye DX");
   report("Limite por placa/canal: 1024 bytes UART o 32 tramas CAN");
   for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
     report("======== " + String(CHANNEL_NAMES[channel]) + " ========");
@@ -1976,14 +1952,19 @@ void processBluetoothCommand(const String& rawCommand) {
     printDetails();
   } else if (command == "TTL1") {
     printChannelDetails(0);
+    requestRemoteDetails(1, false);
   } else if (command == "TTL2") {
     printChannelDetails(1);
+    requestRemoteDetails(2, false);
   } else if (command == "RS485") {
     printChannelDetails(2);
+    requestRemoteDetails(4, false);
   } else if (command == "CAN") {
     printChannelDetails(3);
+    requestRemoteDetails(8, false);
   } else if (command == "RAW") {
     printData();
+    requestRemoteDetails(15, true);
   } else if (command == "HELP") {
     printHelp();
   } else if (command == "RUN") {
@@ -2020,6 +2001,7 @@ void setup() {
   rs485.setRxBufferSize(2048);
   Serial.setTxBufferSize(2048);
   ttl1.setTxBufferSize(2048);
+  rs485.setTxBufferSize(2048);
   Serial.begin(LINK_BAUD, SERIAL_8N1, TTL2_RX, TTL2_TX);
   ttl1.begin(LINK_BAUD, SERIAL_8N1, TTL1_RX, TTL1_TX);
   rs485.begin(RS485_BAUD, SERIAL_8N1, RS485_RX, RS485_TX);
@@ -2031,6 +2013,8 @@ void setup() {
   canController.setBitrate(CAN_250KBPS, MCP_8MHZ);
   canController.setNormalMode();
 
+  auxSession = esp_random();
+  if (!auxSession) auxSession = 1;
   bluetooth.begin("HWTEST-ESP32-" + String(DEVICE_ID));
   delay(300);
   lastStatusAt = lastWindowCapturedAt = millis();
@@ -2041,7 +2025,7 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(PULSE_1), onPulse1, RISING);
     attachInterrupt(digitalPinToInterrupt(PULSE_2), onPulse2, RISING);
   }
-  report("HWTEST listo. Placa " + String(DEVICE_ID));
+  report("HWTEST v2 listo. Placa " + String(DEVICE_ID));
   report("Conecte ambas placas y use STATUS o HELP");
 }
 
@@ -2055,42 +2039,22 @@ void loop() {
       !rs485ReportTrace.complete)
     rs485ReportTrace.complete = true;  // La UART RS485 ya se dreno tras RTX.
   if (DEVICE_ID == 1 && rs485ReportTrace.started &&
-      millis() - rs485ReportTrace.startedAt > 2000)
+      auxTimeReached(millis(), auxRs485QuietUntil))
     rs485ReportTrace.complete = true;
   pollCan();
   processCanInfoQueue();
 
   if (DEVICE_ID == 2 && rs485ReportDue != 0 &&
-      (!rs485AwaitingReady &&
-       static_cast<int32_t>(millis() - rs485ReportDue) >= 0)) {
-    rs485AwaitingReady = true;
-    rs485ReadyReportId = 0;
-    rs485AnnouncedReportId = localReportId;
-    rs485ReportDue = millis() + 1000;  // Limite si no llega confirmacion TTL1.
-    sendDiagnostic("RBEGIN,2," + String(rs485AnnouncedReportId), true);
-  }
-  if (DEVICE_ID == 2 && rs485AwaitingReady &&
-      localReportId != rs485AnnouncedReportId) {
-    rs485ReadyReportId = 0;
-    rs485AnnouncedReportId = localReportId;
-    rs485ReportDue = millis() + 1000;
-    sendDiagnostic("RBEGIN,2," + String(rs485AnnouncedReportId), true);
-  }
-  if (DEVICE_ID == 2 && rs485AwaitingReady &&
-      (rs485ReadyReportId == rs485AnnouncedReportId ||
-       static_cast<int32_t>(millis() - rs485ReportDue) >= 0)) {
-    rs485AwaitingReady = false;
+      static_cast<int32_t>(millis() - rs485ReportDue) >= 0) {
     rs485ReportDue = 0;
     String expected;
-    for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
-      expected += infoLine(channel);
-      expected += "\r\n";
-    }
+    for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel)
+      expected += auxChecked(infoLine(channel)) + "\r\n";
     const uint32_t before = infoBytesSent[2];
     sendInfoSerial(rs485, true);
-    sendDiagnostic("RTX,2," + String(localReportId) + "," +
-                 String(infoBytesSent[2] - before) + "," +
-                 toHexComplete(expected), true);
+    sendDiagnostic("RTX,2," + String(localReportId) + "," + String(rs485RequestId) + "," +
+                   String(infoBytesSent[2] - before) + "," +
+                   toHexComplete(expected), true);
   }
 
   const uint32_t now = millis();
@@ -2100,8 +2064,8 @@ void loop() {
     const String ttl2Message = ttl1Message;
     sendLine(ttl1, ttl1Stats, ttl1Message);
     sendLine(ttl2, ttl2Stats, ttl2Message);
-    if (DEVICE_ID == 1 && rs485ReportTrace.started &&
-        !rs485ReportTrace.complete)
+    if (DEVICE_ID == 1 && (auxRs485Busy() ||
+        (rs485ReportTrace.started && !rs485ReportTrace.complete)))
       rs485PingDeferred = true;  // Evitar solapar el PING con el informe.
     else {
       sendRs485Ping();
@@ -2110,8 +2074,8 @@ void loop() {
     sendCanPing();
     lastPingAt = now;
   }
-  if (DEVICE_ID == 1 && rs485PingDeferred &&
-      rs485ReportTrace.complete) {
+  if (DEVICE_ID == 1 && rs485PingDeferred && !auxRs485Busy() &&
+      (!rs485ReportTrace.started || rs485ReportTrace.complete)) {
     rs485PingDeferred = false;
     if (automaticTestsEnabled) sendRs485Ping();
   }
@@ -2122,12 +2086,17 @@ void loop() {
 
   if (now - lastStatusAt >= STATUS_INTERVAL_MS) {
     captureAllWindows();
-    if (DEVICE_ID == 1) sendInfoSerial(rs485, true);
+    queueWindowDiagnostics();
+    if (DEVICE_ID == 1) rs485InfoDue = true;
     sendInfoSerial(ttl1, false);
     sendInfoSerial(ttl2, false);
     sendInfoCan();
     statusPrintDue = millis() + 1200;
     lastStatusAt = now;
+  }
+  if (DEVICE_ID == 1 && rs485InfoDue && !auxRs485Busy() && !rs485Stats.pending) {
+    rs485InfoDue = false;
+    sendInfoSerial(rs485, true);
   }
   if (statusPrintDue != 0 && static_cast<int32_t>(millis() - statusPrintDue) >= 0) {
     statusPrintDue = 0;
