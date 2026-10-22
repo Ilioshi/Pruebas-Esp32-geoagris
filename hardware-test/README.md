@@ -49,7 +49,7 @@ Si todos los canales fallan, los resultados locales siguen disponibles. Consulta
 
 Cada placa envía los cuatro registros de su ventana por las cuatro vías. UART agrega un CRC; CAN envía datos y un CRC asociado por informe y canal. Solo se acepta una copia con CRC válido. RS485 solicita los informes de placa 2 por el propio bus mediante `IREQ` y reserva un turno para recibirlos; no necesita TTL1.
 
-La primera copia válida del mismo informe es una **referencia provisional**, sin garantizar por sí sola la exactitud de su contenido. `REF`/`REFERENCIA PROVISIONAL`, `IGUAL` y `DIFERENTE` describen la comparación entre copias.
+La copia válida recibida por la **vía auxiliar seleccionada** es la referencia de comparación del mismo informe. Si el auxiliar es TTL2, `REF` aparece en la fila TTL2 aunque TTL1 haya entregado antes una copia válida. `REF`/`REFERENCIA AUXILIAR`, `IGUAL` y `DIFERENTE` describen esta comparación, sin garantizar por sí solos la exactitud del contenido. Si falta la copia reciente del mismo informe por el auxiliar, las copias recibidas indican `SIN REF`/`SIN REFERENCIA AUXILIAR`: no se toma otra vía como referencia automáticamente.
 
 `EN CAMINO` permite 3,5 s desde la primera copia de un informe. `NO LLEGA` indica que no se reconoció una copia válida después del margen. Una confirmación auxiliar pendiente no demuestra una falla del canal ensayado. Las ventanas de las placas no están sincronizadas; sus contadores pueden diferir.
 

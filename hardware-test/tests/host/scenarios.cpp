@@ -46,6 +46,47 @@ int main(int argc, char** argv) {
       return true;
     };
     runFor(30000);
+    if (scenario == "reference_route") {
+      // TTL1 still delivers native INFO, but its auxiliary replies stop.
+      serialFilter = [](int via, int board, std::string& p) {
+        return !(via == 0 && board == 1 && p.rfind("DX,", 0) == 0);
+      };
+      runFor(25000);
+      require(a.route() == 1, "auxiliary did not move to TTL2");
+      require(a.infoMask(0) == 15 && a.infoMask(1) == 15,
+              "both INFO paths must remain available");
+      auto hasLine = [](const char* value) {
+        for (const auto& line : a.bluetooth->output)
+          if (line.find(value) != std::string::npos) return true;
+        return false;
+      };
+      a.bluetooth->output.clear();
+      a.command("DATA"); runFor(1000);
+      require(hasLine("via TTL2: TTL1=REF | TTL2=REF | RS485=REF | CAN=REF"),
+              "matrix reference did not follow auxiliary TTL2");
+      require(!hasLine("via TTL1: TTL1=REF"), "TTL1 retained reference");
+      a.bluetooth->output.clear();
+      a.command("TTL1"); runFor(20000);
+      require(hasLine("TTL1: IGUAL"), "channel detail disagrees with matrix");
+      // Now suppress only TTL2 native INFO, retaining its auxiliary transport.
+      serialFilter = [](int via, int board, std::string& p) {
+        return !(via == 0 && board == 1 && p.rfind("DX,", 0) == 0) &&
+               !(via == 1 && p.rfind("INFO,", 0) == 0);
+      };
+      runFor(25000);
+      require(a.route() == 1 && a.infoMask(1) == 0 && a.infoMask(0) == 15,
+              "missing-reference setup failed");
+      a.bluetooth->output.clear();
+      a.command("DATA"); runFor(1000);
+      require(hasLine("via TTL1: TTL1=SIN REF | TTL2=SIN REF"),
+              "missing auxiliary copy silently fell back to TTL1");
+      a.bluetooth->output.clear();
+      a.command("TTL1"); runFor(20000);
+      require(hasLine("SIN REFERENCIA AUXILIAR"),
+              "channel detail compared without auxiliary reference");
+      std::cout << "PASS reference_route route=" << a.route() << "\n";
+      return 0;
+    }
     if (scenario == "all_down") {
       require(a.route() == -1, "route claimed with all links disconnected");
       a.command("STATUS"); runFor(1500);

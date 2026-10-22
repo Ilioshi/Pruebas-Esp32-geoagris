@@ -22,5 +22,5 @@ subprocess.run(compiler + [str(root/'tests/host/scenarios.cpp'), str(out/'board1
                str(out/'board2.o'), '-o', str(exe)], check=True)
 for scenario in ('healthy', 'ttl2_only', 'can_only', 'rs485_only', 'all_down',
                  'one_way_ttl1', 'failover', 'corrupt_info', 'lost_reply', 'can_loss',
-                 'restart', 'full_can_raw', 'mid_raw_failover', 'rs485_nuls'):
+                 'restart', 'full_can_raw', 'mid_raw_failover', 'rs485_nuls', 'reference_route'):
     subprocess.run([str(exe), scenario], check=True, timeout=60)

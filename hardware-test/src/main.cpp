@@ -1129,6 +1129,17 @@ bool receiveRs485Trace(const String& message) {
 
 #include "diagnostic_transport.h"
 
+// La referencia de las copias INFO siempre procede de la via auxiliar.
+// No sustituirla por una copia que haya llegado antes por otro canal.
+const PeerCopy* auxiliaryPeerCopy(uint8_t channel, uint8_t reportId) {
+  if (auxRoute < 0 || auxRoute >= CHANNEL_COUNT || reportId == 0 ||
+      (DEVICE_ID == 2 && millis() - auxRemoteLastPoll > AUX_HEALTH_MS))
+    return nullptr;
+  const PeerCopy& copy = peerCopies[auxRoute][channel];
+  return copy.reportId == reportId && millis() - copy.receivedAt <= PEER_STALE_MS
+    ? &copy : nullptr;
+}
+
 void sendLine(HardwareSerial& port, LinkStats& stats, const String& message) {
   port.println(message);
   traceLine(txTraceNow[&stats == &ttl1Stats ? 0 : 1], message);
@@ -1144,15 +1155,8 @@ String expectedInfoLine(uint8_t via, const String& message) {
   if (sscanf(message.c_str(), "INFO,%lu,%lu,%lu", &sender, &reportId, &channel) == 3 &&
       sender == (DEVICE_ID == 1 ? 2UL : 1UL) && reportId > 0 &&
       reportId <= 255 && channel < CHANNEL_COUNT) {
-    const PeerCopy* first = nullptr;
-    for (uint8_t referenceVia = 0; referenceVia < CHANNEL_COUNT; ++referenceVia) {
-      if (referenceVia == via) continue;
-      const PeerCopy& reference = peerCopies[referenceVia][channel];
-      if (reference.reportId != reportId ||
-          millis() - reference.receivedAt > PEER_STALE_MS) continue;
-      if (!first || millis() - reference.receivedAt >
-                    millis() - first->receivedAt) first = &reference;
-    }
+    const PeerCopy* first = via == auxRoute ? nullptr :
+      auxiliaryPeerCopy(channel, static_cast<uint8_t>(reportId));
     if (first) {
       const ChannelWindow& w = first->window;
       return "INFO," + String(sender) + "," + String(reportId) + "," +
@@ -1161,7 +1165,7 @@ String expectedInfoLine(uint8_t via, const String& message) {
              String(w.raw) + "," + String(w.invalid);
     }
   }
-  return "";  // Primera copia: el contenido aun no puede contrastarse.
+  return "";  // Sin copia del auxiliar: el contenido aun no puede contrastarse.
 }
 
 bool handleLinkMessage(HardwareSerial& port, LinkStats& stats, String message, bool halfDuplex) {
@@ -1424,7 +1428,7 @@ void reportComparison(const String& name, const FrameComparison* frame) {
   const String verdict = frame->verdict == 1 ? "CORRECTA" :
                          frame->verdict == 2 ? "NO COINCIDE" :
                          frame->verdict == 3 ? "FORMATO INVALIDO" :
-                         "PRIMERA COPIA (sin otra para comparar)";
+                         "SIN COMPARAR (referencia auxiliar no disponible para esta trama)";
   report("  " + name + ": " + verdict);
   if (frame->expected.length())
     report("    esperado: " + showHex(toHex(frame->expected)));
@@ -1493,30 +1497,30 @@ const PeerCopy* currentPeerCopy(uint8_t channel);
 
 void reportBoard2Pulses() {
   if (DEVICE_ID == 2 && pulseRateReady) {
-    report("Pulsos placa 2 (1 s): GPIO27=" +
+    report("Pulsos placa 2 (1 s): IN01=" +
            String(localPulseRate1 / 10) + "." +
-           String(localPulseRate1 % 10) + " p/s; GPIO35=" +
+           String(localPulseRate1 % 10) + " p/s; IN02=" +
            String(localPulseRate2 / 10) + "." +
            String(localPulseRate2 % 10) + " p/s");
   } else if (DEVICE_ID == 1 && peerPulseReceivedAt != 0 &&
              millis() - peerPulseReceivedAt <= 2500) {
-    report("Pulsos placa 2 (1 s): GPIO27=" +
+    report("Pulsos placa 2 (1 s): IN01=" +
            String(peerPulseRate1 / 10) + "." +
-           String(peerPulseRate1 % 10) + " p/s; GPIO35=" +
+           String(peerPulseRate1 % 10) + " p/s; IN02=" +
            String(peerPulseRate2 / 10) + "." +
            String(peerPulseRate2 % 10) + " p/s");
   } else {
     report("Pulsos placa 2 (1 s): sin dato reciente");
   }
   if (DEVICE_ID == 2 && localReportId != 0)
-    report("  Contador (10 s): GPIO27=" + String(localPulse1) +
-           " GPIO35=" + String(localPulse2));
+    report("  Contador (10 s): IN01=" + String(localPulse1) +
+           " IN02=" + String(localPulse2));
   else if (DEVICE_ID == 1 && peerPulseReportId != 0 &&
            peerPulseReportId == latestPeerReportId &&
            millis() - latestPeerAt <= PEER_STALE_MS &&
            millis() - peerPulseReceivedAt <= PEER_STALE_MS)
-    report("  Contador (10 s): GPIO27=" + String(peerPulse1) +
-           " GPIO35=" + String(peerPulse2));
+    report("  Contador (10 s): IN01=" + String(peerPulse1) +
+           " IN02=" + String(peerPulse2));
   else
     report("  Contador (10 s): sin ventana reciente completa");
 }
@@ -1537,6 +1541,10 @@ void printBriefStatus() {
 
 const PeerCopy* currentPeerCopy(uint8_t channel) {
   if (latestPeerReportId == 0 || millis() - latestPeerAt > PEER_STALE_MS) return nullptr;
+  if (const PeerCopy* reference = auxiliaryPeerCopy(channel, latestPeerReportId))
+    return reference;
+  // Mantener los resultados disponibles aunque aun falte la referencia.
+  // La matriz indicara SIN REF y no comparara usando esta copia alternativa.
   for (uint8_t via = 0; via < CHANNEL_COUNT; ++via) {
     const PeerCopy& copy = peerCopies[via][channel];
     if (copy.reportId == latestPeerReportId &&
@@ -1550,18 +1558,10 @@ bool sameWindow(const ChannelWindow& a, const ChannelWindow& b) {
          a.errors == b.errors && a.raw == b.raw && a.invalid == b.invalid;
 }
 
-const PeerCopy* firstPeerCopy(uint8_t channel) {
+const PeerCopy* referencePeerCopy(uint8_t channel) {
   if (latestPeerReportId == 0 || millis() - latestPeerAt > PEER_STALE_MS)
     return nullptr;
-  const PeerCopy* first = nullptr;
-  for (uint8_t via = 0; via < CHANNEL_COUNT; ++via) {
-    const PeerCopy& copy = peerCopies[via][channel];
-    if (copy.reportId != latestPeerReportId ||
-        millis() - copy.receivedAt > PEER_STALE_MS) continue;
-    if (!first || millis() - copy.receivedAt > millis() - first->receivedAt)
-      first = &copy;
-  }
-  return first;
+  return auxiliaryPeerCopy(channel, latestPeerReportId);
 }
 
 String peerInfoText(uint8_t channel, const PeerCopy& copy) {
@@ -1577,10 +1577,13 @@ void reportPeerCopyMatrix() {
   report("======== COPIAS INFO PLACA " + String(DEVICE_ID == 1 ? 2 : 1) +
          " (informe " + String(latestPeerReportId) + ") ========");
   for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
-    const PeerCopy* first = firstPeerCopy(channel);
+    const PeerCopy* first = referencePeerCopy(channel);
     if (first)
-      report("  Referencia provisional " + String(CHANNEL_NAMES[channel]) + ": " +
+      report("  Referencia auxiliar " + String(CHANNEL_NAMES[channel]) + ": " +
              peerInfoText(channel, *first));
+    else
+      report("  Referencia auxiliar " + String(CHANNEL_NAMES[channel]) +
+             ": sin copia reciente del mismo informe por la via auxiliar");
   }
   for (uint8_t via = 0; via < CHANNEL_COUNT; ++via) {
     String summary = "  via " + String(CHANNEL_NAMES[via]) + ": ";
@@ -1591,8 +1594,8 @@ void reportPeerCopyMatrix() {
       summary += '=';
       if (copy.reportId == latestPeerReportId &&
           millis() - copy.receivedAt <= PEER_STALE_MS) {
-        const PeerCopy* first = firstPeerCopy(channel);
-        summary += &copy == first ? "REF" :
+        const PeerCopy* first = referencePeerCopy(channel);
+        summary += !first ? "SIN REF" : &copy == first ? "REF" :
                    first && sameWindow(copy.window, first->window) ?
                    "IGUAL" : "DIFERENTE";
         continue;
@@ -1613,7 +1616,7 @@ void reportPeerCopyMatrix() {
     report(summary);
     for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
       const PeerCopy& copy = peerCopies[via][channel];
-      const PeerCopy* first = firstPeerCopy(channel);
+      const PeerCopy* first = referencePeerCopy(channel);
       const String label = "    " + String(CHANNEL_NAMES[via]) +
                            " / " + CHANNEL_NAMES[channel] + ": ";
       if (first && copy.reportId == latestPeerReportId &&
@@ -1869,7 +1872,7 @@ void reportChannelCopies(uint8_t via) {
     return;
   }
   for (uint8_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
-    const PeerCopy* reference = firstPeerCopy(channel);
+    const PeerCopy* reference = referencePeerCopy(channel);
     const PeerCopy& copy = peerCopies[via][channel];
     const bool received = latestPeerReportId != 0 &&
       copy.reportId == latestPeerReportId &&
@@ -1882,7 +1885,7 @@ void reportChannelCopies(uint8_t via) {
       latestPeerReportId != 0 && saved.seen && saved.verdict == 3 &&
       saved.reportId == latestPeerReportId ? &saved : nullptr;
     report("  " + String(CHANNEL_NAMES[channel]) + ": " +
-           (received ? (reference == &copy ? "REFERENCIA PROVISIONAL" :
+           (received ? (!reference ? "SIN REFERENCIA AUXILIAR" : reference == &copy ? "REFERENCIA AUXILIAR" :
                         reference && sameWindow(reference->window, copy.window)
                         ? "IGUAL" : "DIFERENTE") :
             malformed ? "TRAMA INVALIDA" :
